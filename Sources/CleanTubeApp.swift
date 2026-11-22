@@ -1,32 +1,18 @@
 import AVFoundation
 import SwiftUI
-import UIKit
 
 @main
 struct CleanTubeApp: App {
-    @StateObject private var store = AppStore()
-    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var controller = YouTubeController()
 
     init() {
         configureAudioSession()
-        configureTabBarAppearance()
     }
 
     var body: some Scene {
         WindowGroup {
-            ContentView(store: store)
+            ContentView(controller: controller)
                 .preferredColorScheme(.dark)
-                .onChange(of: scenePhase) { newPhase in
-                    switch newPhase {
-                    case .background:
-                        configureAudioSession()
-                        store.handleEnteringBackground()
-                    case .active:
-                        configureAudioSession()
-                    default:
-                        break
-                    }
-                }
         }
     }
 
@@ -37,16 +23,6 @@ struct CleanTubeApp: App {
             try session.setActive(true)
         } catch {
             print("[CleanTube] AudioSession error: \(error.localizedDescription)")
-        }
-    }
-
-    private func configureTabBarAppearance() {
-        let appearance = UITabBarAppearance()
-        appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = UIColor(white: 0.06, alpha: 1.0)
-        UITabBar.appearance().standardAppearance = appearance
-        if #available(iOS 15.0, *) {
-            UITabBar.appearance().scrollEdgeAppearance = appearance
         }
     }
 }
