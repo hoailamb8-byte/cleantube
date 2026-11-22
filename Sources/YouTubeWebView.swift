@@ -1,0 +1,14 @@
+import SwiftUI
+import WebKit
+
+struct YouTubeWebView: UIViewRepresentable {
+    let webView: WKWebView
+
+    func makeUIView(context: Context) -> WKWebView {
+        webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // State is driven directly via WebViewStore
+    }
+}
