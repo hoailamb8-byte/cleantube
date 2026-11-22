@@ -10,6 +10,7 @@ struct ContentView: View {
         ZStack(alignment: .top) {
             ytDarkBg.ignoresSafeArea()
 
+            // Main Browse Layer (Trang chủ, Shorts, Đăng ký, Bạn)
             VStack(spacing: 0) {
                 if controller.isLoading && controller.estimatedProgress < 1.0 {
                     ProgressView(value: controller.estimatedProgress)
@@ -18,39 +19,23 @@ struct ContentView: View {
                         .frame(height: 2)
                 }
 
-                ZStack(alignment: .bottomTrailing) {
-                    YouTubeWebContainer(webView: controller.webView)
-                        .ignoresSafeArea(.container, edges: [.horizontal])
+                YouTubeWebContainer(webView: controller.browseWebView)
+                    .ignoresSafeArea(.container, edges: [.horizontal])
 
-                    // Quick 1-tap PiP pill when watching a video
-                    if controller.isWatchPage {
-                        Button {
-                            controller.togglePiP()
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "pip.enter")
-                                    .font(.system(size: 13, weight: .semibold))
-                                Text("PiP")
-                                    .font(.caption.weight(.bold))
-                            }
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(Color.black.opacity(0.78))
-                            .clipShape(Capsule())
-                            .overlay(
-                                Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1)
-                            )
-                            .shadow(color: .black.opacity(0.45), radius: 6, y: 2)
-                        }
-                        .padding(.trailing, 14)
-                        .padding(.bottom, 14)
-                        .transition(.opacity.combined(with: .scale))
-                    }
+                // Floating YouTube-style Mini-Player Bar when minimized (video keeps playing!)
+                if controller.hasActiveVideo && !controller.isPlayerExpanded {
+                    miniPlayerBar
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 nativeYouTubeTabBar
             }
+
+            // Persistent Watch Layer — stays mounted when minimized so video/audio NEVER stops!
+            persistentPlayerOverlay
+                .opacity(controller.hasActiveVideo && controller.isPlayerExpanded ? 1 : 0)
+                .allowsHitTesting(controller.hasActiveVideo && controller.isPlayerExpanded)
+                .animation(.easeInOut(duration: 0.22), value: controller.isPlayerExpanded)
 
             if let toast = controller.toastMessage {
                 Text(toast)
@@ -70,6 +55,163 @@ struct ContentView: View {
             CleanTubeToolsSheet(controller: controller)
         }
     }
+
+    // MARK: - Persistent Full-Screen Watch Overlay
+
+    private var persistentPlayerOverlay: some View {
+        VStack(spacing: 0) {
+            // Native YouTube-style top minimize bar
+            HStack(spacing: 10) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        controller.minimizePlayer()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 16, weight: .bold))
+                        Text("Thu nhỏ")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.12))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+
+                Text(controller.activeVideoTitle)
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(.white.opacity(0.85))
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                Button {
+                    controller.togglePiP()
+                } label: {
+                    Image(systemName: "pip.enter")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 34, height: 32)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    showToolsSheet = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 34, height: 32)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        controller.closePlayer()
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.gray)
+                        .frame(width: 30, height: 32)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(ytDarkBg)
+
+            YouTubeWebContainer(webView: controller.playerWebView)
+                .ignoresSafeArea(.container, edges: [.horizontal, .bottom])
+        }
+        .background(ytDarkBg.ignoresSafeArea())
+    }
+
+    // MARK: - YouTube-Style Mini-Player Bar
+
+    private var miniPlayerBar: some View {
+        HStack(spacing: 10) {
+            if let thumbURL = URL(string: "https://i.ytimg.com/vi/\(controller.activeVideoId)/mqdefault.jpg") {
+                AsyncImage(url: thumbURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .aspectRatio(16 / 9, contentMode: .fill)
+                    default:
+                        Color(white: 0.18)
+                    }
+                }
+                .frame(width: 84, height: 48)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(controller.activeVideoTitle)
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                Text(controller.isVideoPlaying ? "Đang phát • Bấm để mở rộng" : "Đã tạm dừng • Bấm để mở rộng")
+                    .font(.caption2)
+                    .foregroundColor(.gray)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+
+            Button {
+                controller.toggleMiniPlayPause()
+            } label: {
+                Image(systemName: controller.isVideoPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 34, height: 36)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                controller.togglePiP()
+            } label: {
+                Image(systemName: "pip.enter")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.85))
+                    .frame(width: 32, height: 36)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    controller.closePlayer()
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.gray)
+                    .frame(width: 30, height: 36)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255))
+        .overlay(
+            Rectangle()
+                .fill(Color.white.opacity(0.12))
+                .frame(height: 0.5),
+            alignment: .top
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.22)) {
+                controller.expandPlayer()
+            }
+        }
+    }
+
+    // MARK: - Native YouTube iOS Tab Bar
 
     private var nativeYouTubeTabBar: some View {
         HStack(spacing: 0) {
@@ -246,7 +388,7 @@ private struct CleanTubeToolsSheet: View {
                 }
 
                 Section(header: Text("Chặn quảng cáo & Nâng cao")) {
-                    Toggle("Chặn quảng cáo (3 lớp)", isOn: $controller.adBlockEnabled)
+                    Toggle("Chặn quảng cáo", isOn: $controller.adBlockEnabled)
                         .tint(.red)
                     Toggle("SponsorBlock (Tự bỏ qua tài trợ)", isOn: $controller.sponsorBlockEnabled)
                         .tint(.red)
@@ -271,7 +413,7 @@ private struct CleanTubeToolsSheet: View {
                     HStack {
                         Text("Phiên bản")
                         Spacer()
-                        Text("CleanTube v3.0")
+                        Text("CleanTube v3.1")
                             .foregroundColor(.secondary)
                     }
                 }

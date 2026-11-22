@@ -1,7 +1,8 @@
 import Foundation
 
 enum YouTubeScripts {
-    /// Runs at document start: background playback patch, HD quality preference, and ad JSON scrubber.
+    /// Runs at document start: background playback patch and HD quality preference.
+    /// Never modifies window.fetch so YouTube's player responses always load cleanly.
     static func earlyPatchJS(backgroundEnabled: Bool, adBlockEnabled: Bool, highQualityEnabled: Bool) -> String {
         var script = "(function() {\n"
 
@@ -15,7 +16,6 @@ enum YouTubeScripts {
                     creation: now
                 });
                 localStorage.setItem('yt-player-quality', qualityPref);
-                sessionStorage.setItem('yt-player-quality', qualityPref);
             } catch (e) {}
             """#
         }
@@ -48,55 +48,114 @@ enum YouTubeScripts {
             """#
         }
 
-        if adBlockEnabled {
-            script += #"""
-            if (!window.__ctFetchPatched && typeof window.fetch === 'function') {
-                window.__ctFetchPatched = true;
-                const origFetch = window.fetch.bind(window);
-                window.fetch = async function(...args) {
-                    const res = await origFetch(...args);
-                    try {
-                        const req = args[0];
-                        const url = typeof req === 'string' ? req : (req && req.url ? req.url : '');
-                        if (url.indexOf('/youtubei/v1/player') !== -1 && res.ok) {
-                            const cloned = res.clone();
-                            const text = await cloned.text();
-                            if (text && (text.indexOf('adPlacements') !== -1 || text.indexOf('playerAds') !== -1 || text.indexOf('adSlots') !== -1)) {
-                                const data = JSON.parse(text);
-                                delete data.adPlacements;
-                                delete data.playerAds;
-                                delete data.adSlots;
-                                delete data.adBreakHeartbeatParams;
-                                return new Response(JSON.stringify(data), {
-                                    status: res.status,
-                                    statusText: res.statusText,
-                                    headers: res.headers
-                                });
-                            }
-                        }
-                    } catch (e) {}
-                    return res;
-                };
-            }
-            """#
-        }
-
         script += "\n})();"
         return script
     }
+
+    /// Runs on the Browse WebView to intercept video clicks and open them in the persistent Player layer
+    /// without losing scroll position or stopping playback when browsing Home/Search.
+    static let browseVideoInterceptJS: String = #"""
+    (function() {
+        if (window.__ctBrowseInterceptInstalled) return;
+        window.__ctBrowseInterceptInstalled = true;
+
+        function postMessageSafe(payload) {
+            try {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cleantube) {
+                    window.webkit.messageHandlers.cleantube.postMessage(payload);
+                }
+            } catch (e) {}
+        }
+
+        document.addEventListener('click', function(e) {
+            let el = e.target;
+            while (el && el !== document && el.tagName !== 'A') {
+                el = el.parentElement;
+            }
+            if (!el || el.tagName !== 'A' || !el.href) return;
+
+            try {
+                const url = new URL(el.href, window.location.href);
+                if (url.hostname.indexOf('youtube.com') !== -1 && url.pathname === '/watch') {
+                    const vid = url.searchParams.get('v');
+                    if (vid) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+
+                        let title = '';
+                        const card = el.closest('ytm-video-with-context-renderer, ytm-compact-video-renderer, ytm-rich-item-renderer, ytm-media-item');
+                        if (card) {
+                            const h = card.querySelector('h3, h4, .media-item-headline');
+                            if (h) title = (h.innerText || '').trim();
+                        }
+                        if (!title) {
+                            title = (el.getAttribute('aria-label') || el.innerText || '').trim();
+                        }
+
+                        postMessageSafe({
+                            type: 'openVideo',
+                            url: url.toString(),
+                            videoId: vid,
+                            title: title
+                        });
+                    }
+                }
+            } catch (err) {}
+        }, true);
+    })();
+    """#
+
+    /// Runs on the Player WebView to keep the native Mini-Player synced with current video title, ID, and play state.
+    static let playerSyncJS: String = #"""
+    (function() {
+        if (window.__ctPlayerSyncInstalled) return;
+        window.__ctPlayerSyncInstalled = true;
+
+        function postState() {
+            try {
+                if (!window.webkit || !window.webkit.messageHandlers || !window.webkit.messageHandlers.cleantube) return;
+                const url = new URL(window.location.href);
+                const vid = url.searchParams.get('v') || '';
+                const v = document.querySelector('video');
+                const playing = v ? (!v.paused && !v.ended) : false;
+
+                let title = '';
+                const titleEl = document.querySelector('h2.slim-video-information-title, .slim-video-metadata-header h2, h1.title');
+                if (titleEl) title = (titleEl.innerText || '').trim();
+                if (!title) title = (document.title || '').replace(/ - YouTube$/i, '').trim();
+
+                window.webkit.messageHandlers.cleantube.postMessage({
+                    type: 'playerState',
+                    videoId: vid,
+                    title: title,
+                    playing: playing
+                });
+            } catch (e) {}
+        }
+
+        document.addEventListener('play', postState, true);
+        document.addEventListener('pause', postState, true);
+        setInterval(postState, 1000);
+    })();
+    """#
 
     /// Runs at document end: native YouTube iOS dark skin, auto HD enforcer, ad cleaner, and live SponsorBlock.
     static func appSkinJS(
         adBlockEnabled: Bool,
         sponsorBlockEnabled: Bool,
         hideShorts: Bool,
-        highQualityEnabled: Bool
+        highQualityEnabled: Bool,
+        isPlayerLayer: Bool
     ) -> String {
         let adBlockFlag = adBlockEnabled ? "true" : "false"
         let sponsorFlag = sponsorBlockEnabled ? "true" : "false"
         let hqFlag = highQualityEnabled ? "true" : "false"
         let hideShortsCSS = hideShorts
             ? "ytm-reel-shelf-renderer, ytm-rich-section-renderer:has(ytm-reel-shelf-renderer) { display: none !important; }"
+            : ""
+        let playerHeaderHideCSS = isPlayerLayer
+            ? "ytm-mobile-topbar-renderer { display: none !important; } .page-container { padding-top: 0 !important; }"
             : ""
 
         return #"""
@@ -158,6 +217,7 @@ enum YouTubeScripts {
                     display: none !important;
                 }
 
+                __PLAYER_HEADER_CSS__
                 __HIDE_SHORTS_CSS__
             `;
 
@@ -183,7 +243,6 @@ enum YouTubeScripts {
                 } catch (e) {}
             }
 
-            // Track user-initiated play/pause (ignoring iOS background auto-pause!)
             if (!window.__ctPlaybackTracked) {
                 window.__ctPlaybackTracked = true;
                 document.addEventListener('play', function(e) {
@@ -198,7 +257,6 @@ enum YouTubeScripts {
                 }, true);
             }
 
-            // Automatically boost video quality to highest HD (1080p+) whenever a new video loads
             let lastQualityVideoId = null;
             function enforceHighQuality() {
                 if (!HIGH_QUALITY) return;
@@ -210,11 +268,11 @@ enum YouTubeScripts {
 
                     const player = document.getElementById('movie_player');
                     if (!player || typeof player.getAvailableQualityLevels !== 'function') return;
+                    if (typeof player.getPlayerState === 'function' && player.getPlayerState() !== 1) return;
 
                     const levels = player.getAvailableQualityLevels();
                     if (!levels || !levels.length) return;
 
-                    // Pick highest available quality (e.g. hd1080, hd720, highres)
                     const preferredOrder = ['hd1080', 'hd1440', 'hd2160', 'highres', 'hd720'];
                     let chosen = levels[0];
                     for (let i = 0; i < preferredOrder.length; i++) {
@@ -234,7 +292,6 @@ enum YouTubeScripts {
                 } catch (e) {}
             }
 
-            // Residual ad cleaner
             let mutedByCleaner = false;
             function cleanAds() {
                 if (!AD_BLOCK) return;
@@ -282,7 +339,6 @@ enum YouTubeScripts {
                 }
             }
 
-            // Live SponsorBlock integration
             let sbVideoId = null;
             let sbSegments = [];
             let sbSkipped = {};
@@ -362,6 +418,7 @@ enum YouTubeScripts {
         .replacingOccurrences(of: "__AD_BLOCK__", with: adBlockFlag)
         .replacingOccurrences(of: "__SPONSOR_BLOCK__", with: sponsorFlag)
         .replacingOccurrences(of: "__HIGH_QUALITY__", with: hqFlag)
+        .replacingOccurrences(of: "__PLAYER_HEADER_CSS__", with: playerHeaderHideCSS)
         .replacingOccurrences(of: "__HIDE_SHORTS_CSS__", with: hideShortsCSS)
     }
 
@@ -421,6 +478,23 @@ enum YouTubeScripts {
     })();
     """#
 
+    static let togglePlayPauseJS: String = #"""
+    (function() {
+        const v = document.querySelector('video');
+        if (!v) return false;
+        if (v.paused) {
+            window.__ctWasPlaying = true;
+            v.play().catch(function() {});
+            return true;
+        } else {
+            window.__ctWasPlaying = false;
+            window.__ctPlayingBeforeBg = false;
+            v.pause();
+            return false;
+        }
+    })();
+    """#
+
     static func setSpeedJS(_ rate: Double) -> String {
         return """
         (function() {
@@ -442,7 +516,6 @@ enum YouTubeScripts {
     })();
     """#
 
-    /// Called right BEFORE app goes to background (willResignActive) to accurately snapshot play state.
     static let markEnteringBackgroundJS: String = #"""
     (function() {
         window.__ctAppInBackground = true;
@@ -460,7 +533,6 @@ enum YouTubeScripts {
     })();
     """#
 
-    /// Aggressively resumes playback if iOS WebKit paused the <video> while entering background.
     static let resumeBackgroundJS: String = #"""
     (function() {
         const v = document.querySelector('video');
