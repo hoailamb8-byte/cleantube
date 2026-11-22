@@ -1,13 +1,15 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 
 @main
 struct CleanTubeApp: App {
-    @StateObject private var store = WebViewStore()
+    @StateObject private var store = AppStore()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
         configureAudioSession()
+        configureTabBarAppearance()
     }
 
     var body: some Scene {
@@ -15,7 +17,15 @@ struct CleanTubeApp: App {
             ContentView(store: store)
                 .preferredColorScheme(.dark)
                 .onChange(of: scenePhase) { newPhase in
-                    handleScenePhaseChange(newPhase)
+                    switch newPhase {
+                    case .background:
+                        configureAudioSession()
+                        store.handleEnteringBackground()
+                    case .active:
+                        configureAudioSession()
+                    default:
+                        break
+                    }
                 }
         }
     }
@@ -30,17 +40,13 @@ struct CleanTubeApp: App {
         }
     }
 
-    private func handleScenePhaseChange(_ phase: ScenePhase) {
-        switch phase {
-        case .background:
-            if store.backgroundPlaybackEnabled {
-                configureAudioSession()
-                store.resumePlaybackInBackgroundIfNeeded()
-            }
-        case .active:
-            configureAudioSession()
-        default:
-            break
+    private func configureTabBarAppearance() {
+        let appearance = UITabBarAppearance()
+        appearance.configureWithOpaqueBackground()
+        appearance.backgroundColor = UIColor(white: 0.06, alpha: 1.0)
+        UITabBar.appearance().standardAppearance = appearance
+        if #available(iOS 15.0, *) {
+            UITabBar.appearance().scrollEdgeAppearance = appearance
         }
     }
 }
