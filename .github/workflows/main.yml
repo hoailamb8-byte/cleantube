@@ -1,0 +1,53 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    name: Build CleanTube.ipa
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned iOS app
+        run: |
+          xcodebuild \
+            -project CleanTube.xcodeproj \
+            -scheme CleanTube \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            clean build
+
+      - name: Package .ipa
+        run: |
+          rm -rf Payload CleanTube.ipa
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/CleanTube.app Payload/CleanTube.app
+          zip -r -9 CleanTube.ipa Payload
+          ls -lh CleanTube.ipa
+
+      - name: Upload CleanTube.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CleanTube-IPA
+          path: CleanTube.ipa
+          retention-days: 30
