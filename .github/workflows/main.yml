@@ -22,7 +22,7 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build unsigned iOS app
+      - name: Archive iOS app
         run: |
           xcodebuild \
             -project CleanTube.xcodeproj \
@@ -30,19 +30,20 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
+            -archivePath build/CleanTube.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=NO \
-            clean build
+            clean archive
 
-      - name: Package .ipa
+      - name: Prepare & Package .ipa
         run: |
           rm -rf Payload CleanTube.ipa
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/CleanTube.app Payload/CleanTube.app
-          zip -r -9 CleanTube.ipa Payload
+          cp -R build/CleanTube.xcarchive/Products/Applications/CleanTube.app Payload/CleanTube.app
+          chmod -R u+rwX,go+rX Payload
+          codesign --force --deep --sign - Payload/CleanTube.app
+          zip -ry -9 CleanTube.ipa Payload
           ls -lh CleanTube.ipa
 
       - name: Upload CleanTube.ipa artifact
