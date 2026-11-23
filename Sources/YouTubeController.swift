@@ -259,7 +259,14 @@ final class YouTubeController: NSObject, ObservableObject {
         let becomeActive = nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in self?.handleReturnToForeground() }
         }
-        lifecycleObservers = [resign, enterBg, becomeActive]
+        let audioInterrupt = nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self, self.backgroundPlaybackEnabled else { return }
+                self.activateAudioSession()
+                self.activeMediaWebView().evaluateJavaScript(YouTubeScripts.resumeBackgroundJS, completionHandler: nil)
+            }
+        }
+        lifecycleObservers = [resign, enterBg, becomeActive, audioInterrupt]
     }
 
     private func activeMediaWebView() -> WKWebView {
@@ -282,7 +289,7 @@ final class YouTubeController: NSObject, ObservableObject {
         }
 
         let target = activeMediaWebView()
-        let delays: [Double] = [0.08, 0.28, 0.65, 1.25]
+        let delays: [Double] = [0.05, 0.15, 0.35, 0.70, 1.25, 2.0]
         for delay in delays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self = self else { return }
@@ -291,7 +298,7 @@ final class YouTubeController: NSObject, ObservableObject {
             }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) { [weak self] in
             self?.endBackgroundTaskIfNeeded()
         }
     }

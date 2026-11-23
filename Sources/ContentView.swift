@@ -413,7 +413,7 @@ private struct CleanTubeToolsSheet: View {
                     HStack {
                         Text("Phiên bản")
                         Spacer()
-                        Text("CleanTube v3.1")
+                        Text("CleanTube v3.2")
                             .foregroundColor(.secondary)
                     }
                 }

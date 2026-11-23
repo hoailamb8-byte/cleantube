@@ -1,8 +1,7 @@
 import Foundation
 
 enum YouTubeScripts {
-    /// Runs at document start: background playback patch and HD quality preference.
-    /// Never modifies window.fetch so YouTube's player responses always load cleanly.
+    /// Runs at document start: ironclad background playback protection and HD quality preference.
     static func earlyPatchJS(backgroundEnabled: Bool, adBlockEnabled: Bool, highQualityEnabled: Bool) -> String {
         var script = "(function() {\n"
 
@@ -24,21 +23,128 @@ enum YouTubeScripts {
             script += #"""
             if (!window.__ctBgPatched) {
                 window.__ctBgPatched = true;
-                window.__ctAppInBackground = false;
-                window.__ctPlayingBeforeBg = false;
+                window.__ctUserPaused = false;
+                window.__ctExplicitNativePause = false;
+                window.__ctLastUserInteraction = 0;
+                window.__ctLastPlayingTime = 0;
+                window.__ctBgTransitionUntil = 0;
+
+                try {
+                    if (navigator.audioSession) {
+                        navigator.audioSession.type = 'playback';
+                    }
+                } catch (e) {}
+
                 try {
                     Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
                     Object.defineProperty(document, 'webkitHidden', { configurable: true, get: () => false });
                     Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
                     Object.defineProperty(document, 'webkitVisibilityState', { configurable: true, get: () => 'visible' });
+                    document.hasFocus = function() { return true; };
 
-                    const blocked = { visibilitychange: 1, webkitvisibilitychange: 1, pagehide: 1 };
                     const origDocAdd = Document.prototype.addEventListener;
+                    const origWinAdd = Window.prototype.addEventListener;
+
+                    // Track real user touches inside the page so we can distinguish user pause vs OS/YouTube auto-pause
+                    const markTouch = function() {
+                        window.__ctLastUserInteraction = Date.now();
+                    };
+                    ['touchstart', 'touchend', 'pointerdown', 'pointerup', 'mousedown', 'click'].forEach(function(evt) {
+                        origDocAdd.call(document, evt, markTouch, true);
+                    });
+
+                    // Detect the exact millisecond iOS starts swiping to Home screen or locking phone
+                    origWinAdd.call(window, 'blur', function() {
+                        if (!window.__ctUserPaused && (Date.now() - window.__ctLastPlayingTime < 3500)) {
+                            window.__ctBgTransitionUntil = Date.now() + 4500;
+                        }
+                    }, true);
+
+                    origDocAdd.call(document, 'visibilitychange', function() {
+                        if (!window.__ctUserPaused && (Date.now() - window.__ctLastPlayingTime < 3500)) {
+                            window.__ctBgTransitionUntil = Date.now() + 4500;
+                        }
+                    }, true);
+
+                    // Track active media state and immediately counter any OS background pause
+                    origDocAdd.call(document, 'play', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO') {
+                            window.__ctUserPaused = false;
+                            window.__ctExplicitNativePause = false;
+                            window.__ctLastPlayingTime = Date.now();
+                        }
+                    }, true);
+
+                    origDocAdd.call(document, 'playing', function(e) {
+                        if (e.target && e.target.tagName === 'VIDEO') {
+                            window.__ctUserPaused = false;
+                            window.__ctLastPlayingTime = Date.now();
+                        }
+                    }, true);
+
+                    origDocAdd.call(document, 'timeupdate', function(e) {
+                        const v = e.target;
+                        if (v && v.tagName === 'VIDEO' && !v.paused && !v.ended) {
+                            window.__ctUserPaused = false;
+                            window.__ctLastPlayingTime = Date.now();
+                        }
+                    }, true);
+
+                    origDocAdd.call(document, 'pause', function(e) {
+                        const v = e.target;
+                        if (!v || v.tagName !== 'VIDEO') return;
+                        if (v.ended || (isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 0.5)) {
+                            return;
+                        }
+                        if (window.__ctExplicitNativePause) {
+                            window.__ctUserPaused = true;
+                            return;
+                        }
+
+                        const now = Date.now();
+                        const inBgTransition = now < window.__ctBgTransitionUntil;
+                        const recentTouch = (now - window.__ctLastUserInteraction) < 650;
+                        const wasRecentlyPlaying = (now - window.__ctLastPlayingTime) < 3500;
+
+                        if (!inBgTransition && recentTouch) {
+                            // User intentionally tapped Pause in the player UI
+                            window.__ctUserPaused = true;
+                            return;
+                        }
+
+                        if (!window.__ctUserPaused && (inBgTransition || wasRecentlyPlaying)) {
+                            // Unwanted background pause triggered by iOS WebKit or YouTube on Home swipe
+                            [15, 70, 180, 380, 750, 1300].forEach(function(ms) {
+                                setTimeout(function() {
+                                    if (v && !window.__ctUserPaused && !window.__ctExplicitNativePause && v.paused && !v.ended) {
+                                        v.play().catch(function() {});
+                                    }
+                                }, ms);
+                            });
+                        }
+                    }, true);
+
+                    // Intercept programmatic video.pause() calls from YouTube's scripts when losing focus
+                    const origPause = HTMLMediaElement.prototype.pause;
+                    HTMLMediaElement.prototype.pause = function() {
+                        if (this.tagName === 'VIDEO' && !window.__ctExplicitNativePause && !this.ended) {
+                            const now = Date.now();
+                            const inBgTransition = now < window.__ctBgTransitionUntil;
+                            const recentTouch = (now - window.__ctLastUserInteraction) < 650;
+                            if (inBgTransition || !recentTouch) {
+                                return;
+                            }
+                            window.__ctUserPaused = true;
+                        }
+                        return origPause.apply(this, arguments);
+                    };
+
+                    // Block YouTube from registering visibility/blur listeners that pause playback
+                    const blocked = { visibilitychange: 1, webkitvisibilitychange: 1, pagehide: 1, blur: 1, freeze: 1 };
                     Document.prototype.addEventListener = function(type, fn, opts) {
                         if (blocked[type]) return;
                         return origDocAdd.call(this, type, fn, opts);
                     };
-                    const origWinAdd = Window.prototype.addEventListener;
                     Window.prototype.addEventListener = function(type, fn, opts) {
                         if (blocked[type]) return;
                         return origWinAdd.call(this, type, fn, opts);
@@ -52,8 +158,7 @@ enum YouTubeScripts {
         return script
     }
 
-    /// Runs on the Browse WebView to intercept video clicks and open them in the persistent Player layer
-    /// without losing scroll position or stopping playback when browsing Home/Search.
+    /// Runs on the Browse WebView to intercept video clicks and open them in the persistent Player layer.
     static let browseVideoInterceptJS: String = #"""
     (function() {
         if (window.__ctBrowseInterceptInstalled) return;
@@ -175,7 +280,6 @@ enum YouTubeScripts {
                     -webkit-touch-callout: none !important;
                 }
 
-                /* Hide duplicate web bottom tab bar (replaced by native SwiftUI YouTube Tab Bar) */
                 ytm-pivot-bar-renderer {
                     height: 0 !important;
                     min-height: 0 !important;
@@ -193,7 +297,6 @@ enum YouTubeScripts {
                     margin-bottom: 0 !important;
                 }
 
-                /* Hide "Open in YouTube App", Premium upsells, and ad slots */
                 ytm-mealbar-promo-renderer,
                 ytm-statement-banner-renderer,
                 ytm-upsell-dialog-renderer,
@@ -241,20 +344,6 @@ enum YouTubeScripts {
                         window.webkit.messageHandlers.cleantube.postMessage({ type: 'toast', message: msg });
                     }
                 } catch (e) {}
-            }
-
-            if (!window.__ctPlaybackTracked) {
-                window.__ctPlaybackTracked = true;
-                document.addEventListener('play', function(e) {
-                    if (e.target && e.target.tagName === 'VIDEO') {
-                        window.__ctWasPlaying = true;
-                    }
-                }, true);
-                document.addEventListener('pause', function(e) {
-                    if (e.target && e.target.tagName === 'VIDEO' && !window.__ctAppInBackground) {
-                        window.__ctWasPlaying = false;
-                    }
-                }, true);
             }
 
             let lastQualityVideoId = null;
@@ -483,13 +572,16 @@ enum YouTubeScripts {
         const v = document.querySelector('video');
         if (!v) return false;
         if (v.paused) {
-            window.__ctWasPlaying = true;
+            window.__ctUserPaused = false;
+            window.__ctExplicitNativePause = false;
+            window.__ctLastPlayingTime = Date.now();
             v.play().catch(function() {});
             return true;
         } else {
-            window.__ctWasPlaying = false;
-            window.__ctPlayingBeforeBg = false;
+            window.__ctUserPaused = true;
+            window.__ctExplicitNativePause = true;
             v.pause();
+            setTimeout(function() { window.__ctExplicitNativePause = false; }, 300);
             return false;
         }
     })();
@@ -509,34 +601,34 @@ enum YouTubeScripts {
     (function() {
         const v = document.querySelector('video');
         if (v) {
-            window.__ctWasPlaying = false;
-            window.__ctPlayingBeforeBg = false;
+            window.__ctUserPaused = true;
+            window.__ctExplicitNativePause = true;
             v.pause();
+            setTimeout(function() { window.__ctExplicitNativePause = false; }, 300);
         }
     })();
     """#
 
     static let markEnteringBackgroundJS: String = #"""
     (function() {
-        window.__ctAppInBackground = true;
-        const v = document.querySelector('video');
-        if (v && !v.paused && !v.ended) {
-            window.__ctPlayingBeforeBg = true;
-            window.__ctWasPlaying = true;
+        if (!window.__ctUserPaused && (Date.now() - (window.__ctLastPlayingTime || 0) < 4000)) {
+            window.__ctBgTransitionUntil = Date.now() + 4500;
         }
     })();
     """#
 
     static let markReturningForegroundJS: String = #"""
     (function() {
-        window.__ctAppInBackground = false;
+        window.__ctBgTransitionUntil = 0;
     })();
     """#
 
     static let resumeBackgroundJS: String = #"""
     (function() {
         const v = document.querySelector('video');
-        if (v && (window.__ctPlayingBeforeBg || window.__ctWasPlaying) && v.paused && !v.ended) {
+        if (!v) return;
+        const wasRecentlyPlaying = (Date.now() - (window.__ctLastPlayingTime || 0)) < 5000;
+        if (!window.__ctUserPaused && wasRecentlyPlaying && v.paused && !v.ended) {
             v.play().catch(function() {});
         }
     })();
