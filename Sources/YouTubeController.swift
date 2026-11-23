@@ -46,18 +46,21 @@ enum TimerOption: Int, CaseIterable, Identifiable {
 
 @MainActor
 final class YouTubeController: NSObject, ObservableObject {
-    // MARK: - Browse State
     @Published var activeTab: YouTubeTab = .home
     @Published var isLoading = false
     @Published var estimatedProgress: Double = 0
     @Published var toastMessage: String?
 
-    // MARK: - Persistent Mini-Player / Watch Layer State
-    @Published var hasActiveVideo = false
-    @Published var isPlayerExpanded = false
+    // MARK: - Watch & In-Page Mini-Player State
+    @Published var isWatchPage = false
+    @Published var isMinimized = false
     @Published var activeVideoId = ""
     @Published var activeVideoTitle = "Đang phát video..."
     @Published var isVideoPlaying = true
+
+    // MARK: - Native Search Bar State
+    @Published var isSearchActive = false
+    @Published var searchText = ""
 
     // MARK: - Playback & Tools
     @Published var playbackRate: Double = 1.0
@@ -67,45 +70,42 @@ final class YouTubeController: NSObject, ObservableObject {
     @Published var adBlockEnabled: Bool {
         didSet {
             UserDefaults.standard.set(adBlockEnabled, forKey: Keys.adBlock)
-            reconfigureAllAndReload()
+            reconfigureAndReload()
         }
     }
 
     @Published var sponsorBlockEnabled: Bool {
         didSet {
             UserDefaults.standard.set(sponsorBlockEnabled, forKey: Keys.sponsorBlock)
-            reconfigureAllAndReload()
+            reconfigureAndReload()
         }
     }
 
     @Published var backgroundPlaybackEnabled: Bool {
         didSet {
             UserDefaults.standard.set(backgroundPlaybackEnabled, forKey: Keys.backgroundPlayback)
-            reconfigureAllAndReload()
+            reconfigureAndReload()
         }
     }
 
     @Published var highQualityEnabled: Bool {
         didSet {
             UserDefaults.standard.set(highQualityEnabled, forKey: Keys.highQuality)
-            reconfigureAllAndReload()
+            reconfigureAndReload()
         }
     }
 
     @Published var hideShortsEnabled: Bool {
         didSet {
             UserDefaults.standard.set(hideShortsEnabled, forKey: Keys.hideShorts)
-            reconfigureAllAndReload()
+            reconfigureAndReload()
         }
     }
 
-    /// Two persistent WebViews sharing the exact same Google login session & cookies:
-    /// - `browseWebView` keeps your Home/Search/Subscriptions scroll position intact.
-    /// - `playerWebView` keeps your video playing continuously in Mini-Player when minimized!
-    let browseWebView: WKWebView
-    let playerWebView: WKWebView
+    /// Single ultra-fast WKWebView so every tap preserves native touch gesture,
+    /// audio plays immediately with zero lag, and in-page Mini-Player keeps the <video> alive!
+    let webView: WKWebView
 
-    private let sharedProcessPool: WKProcessPool
     private var observations: [NSKeyValueObservation] = []
     private var compiledRuleList: WKContentRuleList?
     private var sleepTask: Task<Void, Never>?
@@ -139,59 +139,47 @@ final class YouTubeController: NSObject, ObservableObject {
         self.highQualityEnabled = defaults.bool(forKey: Keys.highQuality)
         self.hideShortsEnabled = defaults.bool(forKey: Keys.hideShorts)
 
-        let pool = WKProcessPool()
-        self.sharedProcessPool = pool
-        let browseConfig = Self.makeConfiguration(pool: pool)
-        let playerConfig = Self.makeConfiguration(pool: pool)
-
-        self.browseWebView = WKWebView(frame: .zero, configuration: browseConfig)
-        self.playerWebView = WKWebView(frame: .zero, configuration: playerConfig)
-        super.init()
-
-        setupWebViews()
-        setupObservers()
-        setupLifecycleNotifications()
-        applyUserScripts()
-        applyDarkModeCookieAndLoad()
-    }
-
-    private static func makeConfiguration(pool: WKProcessPool) -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
-        config.processPool = pool
         config.websiteDataStore = .default()
         config.allowsInlineMediaPlayback = true
         config.allowsPictureInPictureMediaPlayback = true
         config.allowsAirPlayForMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        return config
+
+        self.webView = WKWebView(frame: .zero, configuration: config)
+        super.init()
+
+        setupWebView()
+        setupObservers()
+        setupLifecycleNotifications()
+        applyUserScripts()
+        applyDarkModeCookieAndLoad()
     }
 
-    private func setupWebViews() {
+    private func setupWebView() {
         let bg = UIColor(red: 15/255, green: 15/255, blue: 15/255, alpha: 1)
-        let handler = WeakScriptMessageHandler(delegate: self)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+        webView.isOpaque = false
+        webView.backgroundColor = bg
+        webView.scrollView.backgroundColor = bg
+        webView.scrollView.contentInsetAdjustmentBehavior = .automatic
+        webView.customUserAgent = Self.safariMobileUA
 
-        for wv in [browseWebView, playerWebView] {
-            wv.navigationDelegate = self
-            wv.uiDelegate = self
-            wv.allowsBackForwardNavigationGestures = true
-            wv.isOpaque = false
-            wv.backgroundColor = bg
-            wv.scrollView.backgroundColor = bg
-            wv.scrollView.contentInsetAdjustmentBehavior = .automatic
-            wv.customUserAgent = Self.safariMobileUA
-            wv.configuration.userContentController.add(handler, name: "cleantube")
-        }
+        let handler = WeakScriptMessageHandler(delegate: self)
+        webView.configuration.userContentController.add(handler, name: "cleantube")
 
         let refreshControl = UIRefreshControl()
         refreshControl.tintColor = .white
         refreshControl.addTarget(self, action: #selector(handleRefresh(_:)), for: .valueChanged)
-        browseWebView.scrollView.refreshControl = refreshControl
+        webView.scrollView.refreshControl = refreshControl
     }
 
     private func setupObservers() {
         observations = [
-            browseWebView.observe(\.isLoading, options: [.new]) { [weak self] view, _ in
+            webView.observe(\.isLoading, options: [.new]) { [weak self] view, _ in
                 Task { @MainActor [weak self] in
                     self?.isLoading = view.isLoading
                     if !view.isLoading {
@@ -199,49 +187,47 @@ final class YouTubeController: NSObject, ObservableObject {
                     }
                 }
             },
-            browseWebView.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
+            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] view, _ in
                 Task { @MainActor [weak self] in
                     self?.estimatedProgress = view.estimatedProgress
                 }
             },
-            browseWebView.observe(\.url, options: [.new]) { [weak self] view, _ in
+            webView.observe(\.url, options: [.new]) { [weak self] view, _ in
                 Task { @MainActor [weak self] in
-                    self?.handleBrowseURLChange(view.url)
+                    self?.handleURLChange(view.url)
                 }
             }
         ]
     }
 
-    private func handleBrowseURLChange(_ url: URL?) {
+    private func handleURLChange(_ url: URL?) {
         guard let url = url else { return }
         let path = url.path.lowercased()
+        let nowWatch = (path == "/watch")
 
-        // Fallback catch: if YouTube SPA routed browseWebView to /watch, redirect cleanly into playerWebView
-        if url.host?.lowercased().contains("youtube.com") == true, path == "/watch",
-           let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let vid = components.queryItems?.first(where: { $0.name == "v" })?.value {
-            browseWebView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
-            if browseWebView.canGoBack {
-                browseWebView.goBack()
-            } else if let home = URL(string: "https://m.youtube.com") {
-                browseWebView.load(URLRequest(url: home))
-            }
-            openVideo(urlString: url.absoluteString, videoId: vid, title: "")
-            return
+        if nowWatch && !isWatchPage {
+            // Opened a new video -> show full player
+            isMinimized = false
+        } else if !nowWatch {
+            isMinimized = false
         }
+        isWatchPage = nowWatch
 
         if path == "/" || path.isEmpty {
             activeTab = .home
         } else if path.hasPrefix("/shorts") {
             activeTab = .shorts
-            // Pause floating mini-player if user enters Shorts so audio doesn't overlap
-            if hasActiveVideo && !isPlayerExpanded {
-                playerWebView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
-            }
         } else if path.hasPrefix("/feed/subscriptions") {
             activeTab = .subscriptions
         } else if path.hasPrefix("/feed/library") || path.hasPrefix("/feed/you") || path.hasPrefix("/feed/history") {
             activeTab = .you
+        }
+
+        if nowWatch && playbackRate != 1.0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                guard let self = self else { return }
+                self.webView.evaluateJavaScript(YouTubeScripts.setSpeedJS(self.playbackRate), completionHandler: nil)
+            }
         }
     }
 
@@ -263,20 +249,16 @@ final class YouTubeController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self = self, self.backgroundPlaybackEnabled else { return }
                 self.activateAudioSession()
-                self.activeMediaWebView().evaluateJavaScript(YouTubeScripts.resumeBackgroundJS, completionHandler: nil)
+                self.webView.evaluateJavaScript(YouTubeScripts.resumeBackgroundJS, completionHandler: nil)
             }
         }
         lifecycleObservers = [resign, enterBg, becomeActive, audioInterrupt]
     }
 
-    private func activeMediaWebView() -> WKWebView {
-        hasActiveVideo ? playerWebView : browseWebView
-    }
-
     private func prepareForBackground() {
         guard backgroundPlaybackEnabled else { return }
         activateAudioSession()
-        activeMediaWebView().evaluateJavaScript(YouTubeScripts.markEnteringBackgroundJS, completionHandler: nil)
+        webView.evaluateJavaScript(YouTubeScripts.markEnteringBackgroundJS, completionHandler: nil)
     }
 
     private func keepPlayingInBackground() {
@@ -288,13 +270,12 @@ final class YouTubeController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in self?.endBackgroundTaskIfNeeded() }
         }
 
-        let target = activeMediaWebView()
         let delays: [Double] = [0.05, 0.15, 0.35, 0.70, 1.25, 2.0]
         for delay in delays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self = self else { return }
                 self.activateAudioSession()
-                target.evaluateJavaScript(YouTubeScripts.resumeBackgroundJS, completionHandler: nil)
+                self.webView.evaluateJavaScript(YouTubeScripts.resumeBackgroundJS, completionHandler: nil)
             }
         }
 
@@ -306,8 +287,7 @@ final class YouTubeController: NSObject, ObservableObject {
     private func handleReturnToForeground() {
         endBackgroundTaskIfNeeded()
         activateAudioSession()
-        browseWebView.evaluateJavaScript(YouTubeScripts.markReturningForegroundJS, completionHandler: nil)
-        playerWebView.evaluateJavaScript(YouTubeScripts.markReturningForegroundJS, completionHandler: nil)
+        webView.evaluateJavaScript(YouTubeScripts.markReturningForegroundJS, completionHandler: nil)
     }
 
     private func endBackgroundTaskIfNeeded() {
@@ -325,56 +305,38 @@ final class YouTubeController: NSObject, ObservableObject {
         } catch {}
     }
 
-    // MARK: - Script & Content Blocker Setup
+    // MARK: - Scripts & Content Blocker
 
     private func applyUserScripts() {
-        let earlySource = YouTubeScripts.earlyPatchJS(
-            backgroundEnabled: backgroundPlaybackEnabled,
-            adBlockEnabled: adBlockEnabled,
-            highQualityEnabled: highQualityEnabled
-        )
+        let controller = webView.configuration.userContentController
+        controller.removeAllUserScripts()
 
-        // Browse WebView scripts
-        let browseController = browseWebView.configuration.userContentController
-        browseController.removeAllUserScripts()
-        browseController.addUserScript(WKUserScript(source: earlySource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        browseController.addUserScript(
-            WKUserScript(
-                source: YouTubeScripts.appSkinJS(
-                    adBlockEnabled: adBlockEnabled,
-                    sponsorBlockEnabled: sponsorBlockEnabled,
-                    hideShorts: hideShortsEnabled,
-                    highQualityEnabled: highQualityEnabled,
-                    isPlayerLayer: false
-                ),
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: false
-            )
+        let early = WKUserScript(
+            source: YouTubeScripts.earlyPatchJS(
+                backgroundEnabled: backgroundPlaybackEnabled,
+                adBlockEnabled: adBlockEnabled,
+                highQualityEnabled: highQualityEnabled
+            ),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
         )
-        browseController.addUserScript(WKUserScript(source: YouTubeScripts.browseVideoInterceptJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        controller.addUserScript(early)
 
-        // Player WebView scripts
-        let playerController = playerWebView.configuration.userContentController
-        playerController.removeAllUserScripts()
-        playerController.addUserScript(WKUserScript(source: earlySource, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        playerController.addUserScript(
-            WKUserScript(
-                source: YouTubeScripts.appSkinJS(
-                    adBlockEnabled: adBlockEnabled,
-                    sponsorBlockEnabled: sponsorBlockEnabled,
-                    hideShorts: false,
-                    highQualityEnabled: highQualityEnabled,
-                    isPlayerLayer: true
-                ),
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: false
-            )
+        let skin = WKUserScript(
+            source: YouTubeScripts.appSkinJS(
+                adBlockEnabled: adBlockEnabled,
+                sponsorBlockEnabled: sponsorBlockEnabled,
+                hideShorts: hideShortsEnabled,
+                highQualityEnabled: highQualityEnabled
+            ),
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: false
         )
-        playerController.addUserScript(WKUserScript(source: YouTubeScripts.playerSyncJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        controller.addUserScript(skin)
     }
 
     private func applyDarkModeCookieAndLoad() {
-        let cookieStore = browseWebView.configuration.websiteDataStore.httpCookieStore
+        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
         cookieStore.getAllCookies { [weak self] cookies in
             let hasPref = cookies.contains { $0.domain.contains("youtube.com") && $0.name == "PREF" }
             if !hasPref, let darkCookie = HTTPCookie(properties: [
@@ -397,13 +359,12 @@ final class YouTubeController: NSObject, ObservableObject {
     private func attachContentBlockerAndLoad() {
         compileAndAttachContentBlocker { [weak self] in
             guard let self = self, let url = URL(string: "https://m.youtube.com") else { return }
-            self.browseWebView.load(URLRequest(url: url))
+            self.webView.load(URLRequest(url: url))
         }
     }
 
     private func compileAndAttachContentBlocker(completion: (() -> Void)? = nil) {
-        browseWebView.configuration.userContentController.removeAllContentRuleLists()
-        playerWebView.configuration.userContentController.removeAllContentRuleLists()
+        webView.configuration.userContentController.removeAllContentRuleLists()
 
         guard adBlockEnabled else {
             completion?()
@@ -411,8 +372,7 @@ final class YouTubeController: NSObject, ObservableObject {
         }
 
         if let existing = compiledRuleList {
-            browseWebView.configuration.userContentController.add(existing)
-            playerWebView.configuration.userContentController.add(existing)
+            webView.configuration.userContentController.add(existing)
             completion?()
             return
         }
@@ -421,80 +381,49 @@ final class YouTubeController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 if let ruleList = ruleList {
                     self?.compiledRuleList = ruleList
-                    self?.browseWebView.configuration.userContentController.add(ruleList)
-                    self?.playerWebView.configuration.userContentController.add(ruleList)
+                    self?.webView.configuration.userContentController.add(ruleList)
                 }
                 completion?()
             }
         }
     }
 
-    private func reconfigureAllAndReload() {
+    private func reconfigureAndReload() {
         applyUserScripts()
         compileAndAttachContentBlocker { [weak self] in
-            self?.browseWebView.reload()
-            if self?.hasActiveVideo == true {
-                self?.playerWebView.reload()
-            }
+            self?.webView.reload()
         }
     }
 
     @objc private func handleRefresh(_ sender: UIRefreshControl) {
-        browseWebView.reload()
+        webView.reload()
     }
 
-    // MARK: - Persistent Mini-Player & Video Actions
+    // MARK: - In-Page Mini-Player & Search Actions
 
-    func openVideo(urlString: String, videoId: String, title: String) {
-        guard let url = URL(string: urlString) else { return }
-        if activeVideoId == videoId && hasActiveVideo {
-            isPlayerExpanded = true
-            return
-        }
-
-        // Stop any Shorts playing in browseWebView
-        browseWebView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
-
-        activeVideoId = videoId
-        if !title.isEmpty {
-            activeVideoTitle = title
-        } else {
-            activeVideoTitle = "Đang tải video..."
-        }
-        hasActiveVideo = true
-        isPlayerExpanded = true
-        isVideoPlaying = true
-
-        playerWebView.load(URLRequest(url: url))
-
-        if playbackRate != 1.0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                guard let self = self else { return }
-                self.playerWebView.evaluateJavaScript(YouTubeScripts.setSpeedJS(self.playbackRate), completionHandler: nil)
-            }
-        }
+    func minimizeVideo() {
+        guard isWatchPage else { return }
+        isMinimized = true
+        webView.evaluateJavaScript(YouTubeScripts.setMiniModeJS(true), completionHandler: nil)
     }
 
-    func minimizePlayer() {
-        isPlayerExpanded = false
+    func expandVideo() {
+        guard isWatchPage else { return }
+        isMinimized = false
+        isSearchActive = false
+        webView.evaluateJavaScript(YouTubeScripts.setMiniModeJS(false), completionHandler: nil)
     }
 
-    func expandPlayer() {
-        guard hasActiveVideo else { return }
-        isPlayerExpanded = true
-    }
-
-    func closePlayer() {
-        playerWebView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
-        playerWebView.loadHTMLString("<html><body style='background:#0f0f0f'></body></html>", baseURL: nil)
-        hasActiveVideo = false
-        isPlayerExpanded = false
-        activeVideoId = ""
-        isVideoPlaying = false
+    func closeMiniPlayer() {
+        isMinimized = false
+        isWatchPage = false
+        webView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
+        webView.evaluateJavaScript(YouTubeScripts.setMiniModeJS(false), completionHandler: nil)
+        selectTab(.home)
     }
 
     func toggleMiniPlayPause() {
-        playerWebView.evaluateJavaScript(YouTubeScripts.togglePlayPauseJS) { [weak self] result, _ in
+        webView.evaluateJavaScript(YouTubeScripts.togglePlayPauseJS) { [weak self] result, _ in
             if let playing = result as? Bool {
                 Task { @MainActor [weak self] in
                     self?.isVideoPlaying = playing
@@ -503,43 +432,52 @@ final class YouTubeController: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Navigation & Tools
+    func submitSearch() {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if isWatchPage {
+            isMinimized = true
+        }
+        webView.evaluateJavaScript(YouTubeScripts.inPageSearchJS(trimmed), completionHandler: nil)
+        isSearchActive = false
+    }
 
     func selectTab(_ tab: YouTubeTab) {
         activeTab = tab
-        if isPlayerExpanded {
-            minimizePlayer()
+        isSearchActive = false
+
+        // If user taps "Trang chủ" while watching a video full-screen, minimize video into Mini-Player
+        // so the video keeps playing while they browse recommendations & search!
+        if isWatchPage && !isMinimized && tab == .home {
+            minimizeVideo()
+            showToast("Đã thu nhỏ video • Bấm Tìm kiếm ở góc trên để tìm bài khác")
+            return
         }
-        let host = browseWebView.url?.host?.lowercased() ?? ""
+
+        isMinimized = false
+        let host = webView.url?.host?.lowercased() ?? ""
         if host.contains("youtube.com") {
             let js = YouTubeScripts.navigateTabJS(path: tab.path, fallbackURL: tab.urlString)
-            browseWebView.evaluateJavaScript(js, completionHandler: nil)
+            webView.evaluateJavaScript(js, completionHandler: nil)
         } else if let url = URL(string: tab.urlString) {
-            browseWebView.load(URLRequest(url: url))
+            webView.load(URLRequest(url: url))
         }
     }
 
     func openGoogleSignIn() {
-        if isPlayerExpanded {
-            minimizePlayer()
-        }
+        isMinimized = false
         guard let url = URL(string: "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fm.youtube.com%2F") else {
             return
         }
-        browseWebView.load(URLRequest(url: url))
+        webView.load(URLRequest(url: url))
     }
 
     func reload() {
-        if isPlayerExpanded && hasActiveVideo {
-            playerWebView.reload()
-        } else {
-            browseWebView.reload()
-        }
+        webView.reload()
     }
 
     func togglePiP() {
-        let target = activeMediaWebView()
-        target.evaluateJavaScript(YouTubeScripts.togglePiPJS) { [weak self] result, _ in
+        webView.evaluateJavaScript(YouTubeScripts.togglePiPJS) { [weak self] result, _ in
             guard let status = result as? String else { return }
             Task { @MainActor [weak self] in
                 if status == "no-video" {
@@ -553,7 +491,7 @@ final class YouTubeController: NSObject, ObservableObject {
 
     func setPlaybackRate(_ rate: Double) {
         playbackRate = rate
-        activeMediaWebView().evaluateJavaScript(YouTubeScripts.setSpeedJS(rate), completionHandler: nil)
+        webView.evaluateJavaScript(YouTubeScripts.setSpeedJS(rate), completionHandler: nil)
         showToast("Tốc độ phát: \(String(format: "%.2gx", rate))")
     }
 
@@ -577,8 +515,7 @@ final class YouTubeController: NSObject, ObservableObject {
                 self.sleepSecondsRemaining -= 1
             }
             guard let self = self, !Task.isCancelled else { return }
-            self.playerWebView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
-            self.browseWebView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
+            self.webView.evaluateJavaScript(YouTubeScripts.pauseVideoJS, completionHandler: nil)
             self.sleepTimerOption = .off
             self.showToast("Đã tự động tạm dừng theo hẹn giờ ngủ")
         }
@@ -589,7 +526,6 @@ final class YouTubeController: NSObject, ObservableObject {
     }
 
     func clearCacheAndSignOut() {
-        closePlayer()
         let store = WKWebsiteDataStore.default()
         store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             Task { @MainActor [weak self] in
@@ -622,13 +558,13 @@ extension YouTubeController: WKScriptMessageHandler {
             if let text = dict["message"] as? String {
                 showToast(text)
             }
-        case "openVideo":
-            if let urlStr = dict["url"] as? String,
-               let vid = dict["videoId"] as? String {
-                let title = dict["title"] as? String ?? ""
-                openVideo(urlString: urlStr, videoId: vid, title: title)
-            }
         case "playerState":
+            if let isWatch = dict["isWatch"] as? Bool {
+                if !isWatch && isMinimized {
+                    isMinimized = false
+                }
+                isWatchPage = isWatch
+            }
             if let vid = dict["videoId"] as? String, !vid.isEmpty {
                 activeVideoId = vid
             }
@@ -660,19 +596,6 @@ extension YouTubeController: WKNavigationDelegate {
             decisionHandler(.cancel)
             return
         }
-
-        // If browseWebView navigates to /watch via full link click, open in persistent playerWebView instead
-        if webView === browseWebView,
-           navigationAction.navigationType == .linkActivated,
-           url.host?.lowercased().contains("youtube.com") == true,
-           url.path.lowercased() == "/watch",
-           let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let vid = components.queryItems?.first(where: { $0.name == "v" })?.value {
-            decisionHandler(.cancel)
-            openVideo(urlString: url.absoluteString, videoId: vid, title: "")
-            return
-        }
-
         decisionHandler(.allow)
     }
 }
